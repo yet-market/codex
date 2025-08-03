@@ -1,0 +1,4 @@
+{
+  "provider": "openrouter",
+  "model": "deepseek/deepseek-r1"
+}

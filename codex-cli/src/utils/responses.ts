@@ -3,6 +3,7 @@ import type {
   ResponseCreateParams,
   Response,
 } from "openai/resources/responses/responses";
+import { WizardLMFunctionWrapper } from "./wizardlm-function-wrapper.js";
 
 // Define interfaces based on OpenAI API documentation
 type ResponseCreateInput = ResponseCreateParams;
@@ -285,6 +286,18 @@ const createCompletion = (openai: OpenAI, input: ResponseCreateInput) => {
     metadata: input.metadata,
   };
 
+  // Enable reasoning tokens for supported models via OpenRouter
+  console.log(`🧠 [Debug] Checking model for reasoning: ${input.model}`);
+  if (input.model?.includes('gemini') || input.model?.includes('claude') || input.model?.includes('deepseek')) {
+    console.log(`🧠 [Reasoning] Enabling reasoning tokens for model: ${input.model}`);
+    (chatInput as any).reasoning = {
+      enabled: true,
+      exclude: false
+    };
+  } else {
+    console.log(`🧠 [Debug] Model ${input.model} not supported for reasoning tokens`);
+  }
+
   return openai.chat.completions.create(chatInput);
 };
 
@@ -301,6 +314,21 @@ async function responsesCreateViaChatCompletions(
   openai: OpenAI,
   input: ResponseCreateInput,
 ): Promise<ResponseOutput | AsyncGenerator<ResponseEvent>> {
+  // Check if this is a model that needs function calling wrapper
+  const needsFunctionWrapper = input.model?.includes('wizardlm') || 
+                               input.model?.includes('llama') ||
+                               input.model?.includes('mixtral');
+  
+  if (needsFunctionWrapper && input.tools && input.tools.length > 0) {
+    console.log(`🧙 [WizardLM] Using function calling wrapper for model: ${input.model}`);
+    return await handleWizardLMFunctionCalling(openai, input);
+  }
+  
+  // Gemini models have native function calling support
+  if (input.model?.includes('gemini')) {
+    console.log(`💎 [Gemini] Using native function calling for model: ${input.model}`);
+  }
+  
   const completion = await createCompletion(openai, input);
   if (input.stream) {
     return streamResponses(
@@ -330,6 +358,11 @@ async function nonStreamResponses(
     const assistantMessage = chatResponse.choices?.[0]?.message;
     if (!assistantMessage) {
       throw new Error("No assistant message in chat completion response");
+    }
+    
+    // Log reasoning if present (Gemini 2.5 Flash format)
+    if ((assistantMessage as any).reasoning) {
+      console.log(`🧠 [Non-streaming] Reasoning detected: ${(assistantMessage as any).reasoning.length} chars`);
     }
 
     // Construct ResponseOutput
@@ -485,11 +518,22 @@ async function* streamResponses(
   yield { type: "response.created", response: initialResponse };
   yield { type: "response.in_progress", response: initialResponse };
   let isToolCall = false;
+  let accumulatedReasoning = ""; // Track reasoning content across chunks
+  
   for await (const chunk of completion as AsyncIterable<OpenAI.ChatCompletionChunk>) {
     // console.error('\nCHUNK: ', JSON.stringify(chunk));
     const choice = chunk.choices?.[0];
     if (!choice) {
       continue;
+    }
+    
+    // Capture reasoning from streaming delta (DeepSeek R1 format)
+    if (choice.delta && (choice.delta as any).reasoning) {
+      const reasoningChunk = (choice.delta as any).reasoning;
+      if (typeof reasoningChunk === 'string') {
+        accumulatedReasoning += reasoningChunk;
+        console.log(`🧠 [Streaming] Reasoning chunk: ${reasoningChunk.length} chars`);
+      }
     }
     if (
       !isToolCall &&
@@ -625,7 +669,14 @@ async function* streamResponses(
           content: [
             { type: "output_text", text: textContent, annotations: [] },
           ],
-        };
+        } as any;
+        
+        // Add accumulated reasoning to the output item for Universal Reasoning Handler
+        if (accumulatedReasoning.length > 0) {
+          item.reasoning = accumulatedReasoning;
+          console.log(`🧠 [Streaming] Added reasoning to output item: ${accumulatedReasoning.length} chars`);
+        }
+        
         yield {
           type: "response.output_item.done",
           output_index: 0,
@@ -672,6 +723,12 @@ async function* streamResponses(
 
     if (textContent) {
       assistantMessage.content = textContent;
+    }
+    
+    // Add accumulated reasoning to the assistant message for Universal Reasoning Handler
+    if (accumulatedReasoning.length > 0) {
+      console.log(`🧠 [Streaming] Final reasoning: ${accumulatedReasoning.length} chars total`);
+      (assistantMessage as any).reasoning = accumulatedReasoning;
     }
 
     // Add tool_calls property if needed

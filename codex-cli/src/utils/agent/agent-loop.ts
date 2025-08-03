@@ -18,6 +18,7 @@ import {
   OPENAI_ORGANIZATION,
   OPENAI_PROJECT,
   getBaseUrl,
+  getApiKey,
   AZURE_OPENAI_API_VERSION,
 } from "../config.js";
 import { log } from "../logger/log.js";
@@ -31,6 +32,7 @@ import {
 } from "../session.js";
 import { applyPatchToolInstructions } from "./apply-patch.js";
 import { handleExecCommand } from "./handle-exec-command.js";
+import { enhanceInstructionsWithContext, processReasoningStreamInBackground } from "../smart-context/smart-context-service.js";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -241,6 +243,34 @@ export class AgentLoop {
   }
 
   /**
+   * Extract user prompt from input items for smart context analysis
+   */
+  private extractUserPrompt(input: Array<ResponseInputItem>): string | null {
+    try {
+      // Look for user messages in the input
+      for (const item of input) {
+        if (item.type === "message" && (item as any).role === "user") {
+          const content = (item as any).content;
+          if (typeof content === "string") {
+            return content;
+          } else if (Array.isArray(content)) {
+            // Handle content array format
+            for (const contentItem of content) {
+              if (contentItem.type === "input_text" && contentItem.text) {
+                return contentItem.text;
+              }
+            }
+          }
+        }
+      }
+      return null;
+    } catch (error) {
+      log(`[SmartContext] Failed to extract user prompt: ${error}`);
+      return null;
+    }
+  }
+
+  /**
    * Hard‑stop the agent loop. After calling this method the instance becomes
    * unusable: any in‑flight operations are aborted and subsequent invocations
    * of `run()` will throw.
@@ -306,8 +336,30 @@ export class AgentLoop {
     this.sessionId = getSessionId() || randomUUID().replaceAll("-", "");
     // Configure OpenAI client with optional timeout (ms) from environment
     const timeoutMs = OPENAI_TIMEOUT_MS;
-    const apiKey = this.config.apiKey ?? process.env["OPENAI_API_KEY"] ?? "";
+    // Use provider-specific API key instead of hardcoded OPENAI_API_KEY
+    // Priority: 1) config, 2) provider env var, 3) OpenAI fallback
+    const configApiKey = this.config.apiKey;
+    const providerEnvKey = process.env[`${this.provider.toUpperCase()}_API_KEY`];
+    const providerApiKey = getApiKey(this.provider);
+    const openaiEnvKey = process.env["OPENAI_API_KEY"];
+    
+    console.log(`🔍 [DEBUG] API Key Sources:`);
+    console.log(`🔍 [DEBUG]   config.apiKey: ${configApiKey ? configApiKey.substring(0, 10) + '...' : 'NOT SET'}`);
+    console.log(`🔍 [DEBUG]   ${this.provider.toUpperCase()}_API_KEY: ${providerEnvKey ? providerEnvKey.substring(0, 10) + '...' : 'NOT SET'}`);
+    console.log(`🔍 [DEBUG]   getApiKey(${this.provider}): ${providerApiKey ? providerApiKey.substring(0, 10) + '...' : 'NOT SET'}`);
+    console.log(`🔍 [DEBUG]   OPENAI_API_KEY: ${openaiEnvKey ? openaiEnvKey.substring(0, 10) + '...' : 'NOT SET'}`);
+    
+    // For non-OpenAI providers, prioritize environment variable over config
+    const apiKey = (this.provider !== "openai" && providerEnvKey) ? 
+                   providerEnvKey : 
+                   (configApiKey ?? providerEnvKey ?? providerApiKey ?? openaiEnvKey ?? "");
     const baseURL = getBaseUrl(this.provider);
+    
+    // Debug logging for provider configuration
+    console.log(`🔍 [DEBUG] Provider: ${this.provider}`);
+    console.log(`🔍 [DEBUG] Base URL: ${baseURL}`);
+    console.log(`🔍 [DEBUG] Final API Key: ${apiKey ? apiKey.substring(0, 10) + '...' : 'NOT SET'}`);
+    console.log(`🔍 [DEBUG] Provider config: ${JSON.stringify(this.config.provider)}`);
 
     this.oai = new OpenAI({
       // The OpenAI JS SDK only requires `apiKey` when making requests against
@@ -621,6 +673,12 @@ export class AgentLoop {
       if (this.model.startsWith("codex")) {
         tools = [localShellTool];
       }
+      
+      // Disable tools for non-OpenAI providers that don't support function calling
+      if (this.config.provider && this.config.provider.toLowerCase() !== "openai") {
+        console.log(`🔧 [DEBUG] Disabling tools for provider: ${this.config.provider}`);
+        tools = [];
+      }
 
       const stripInternalFields = (
         item: ResponseInputItem,
@@ -783,17 +841,49 @@ export class AgentLoop {
           try {
             let reasoning: Reasoning | undefined;
             let modelSpecificInstructions: string | undefined;
-            if (this.model.startsWith("o") || this.model.startsWith("codex")) {
-              reasoning = { effort: this.config.reasoningEffort ?? "medium" };
-              reasoning.summary = "auto";
+            // Only enable reasoning for OpenAI provider to avoid API errors
+            if ((!this.config.provider || this.config.provider?.toLowerCase() === "openai") && 
+                (this.model.startsWith("o") || this.model.startsWith("codex"))) {
+              reasoning = { effort: this.config.reasoningEffort ?? "high" }; // Use "high" for more detailed reasoning
+              reasoning.summary = "detailed"; // Try "detailed" for better access to reasoning content
             }
             if (this.model.startsWith("gpt-4.1")) {
               modelSpecificInstructions = applyPatchToolInstructions;
             }
+
+            // Extract user prompt for smart context analysis
+            const userPrompt = this.extractUserPrompt(turnInput);
+            
+            // Enhance instructions with smart context and store context from prompt
+            let enhancedInstructions = this.instructions || "";
+            if (userPrompt) {
+              console.log(`📝 [SmartContext] USER PROMPT DETECTED: "${userPrompt.substring(0, 50)}..."`);
+              try {
+                const contextResult = await enhanceInstructionsWithContext(
+                  this.instructions || "",
+                  userPrompt,
+                  process.cwd(),
+                  { storeContext: true } // Enable context storage
+                );
+                if (contextResult.success) {
+                  enhancedInstructions = contextResult.enhancedInstructions;
+                  log(`[SmartContext] Enhanced instructions: ${contextResult.contextSummary}`);
+                  
+                  // Log storage results if available
+                  if (contextResult.storageResult?.stored) {
+                    log(`[SmartContext] Stored context: ${contextResult.storageResult.filesCreated} files`);
+                  }
+                }
+              } catch (error) {
+                log(`[SmartContext] Context enhancement failed: ${error}`);
+                // Continue with original instructions
+              }
+            }
+
             const mergedInstructions = [
               prefix,
               modelSpecificInstructions,
-              this.instructions,
+              enhancedInstructions,
             ]
               .filter(Boolean)
               .join("\n");
@@ -1041,11 +1131,68 @@ export class AgentLoop {
               // process and surface each item (no-op until we can depend on streaming events)
               if (event.type === "response.output_item.done") {
                 const item = event.item;
-                // 1) if it's a reasoning item, annotate it
-                type ReasoningItem = { type?: string; duration_ms?: number };
-                const maybeReasoning = item as ReasoningItem;
-                if (maybeReasoning.type === "reasoning") {
+                
+                // Universal Reasoning Handler - supports all providers
+                const { universalReasoningHandler } = await import('../reasoning/reasoning-handler.js');
+                
+                // Debug: Show available fields
+                universalReasoningHandler.debugItem(item as any);
+                
+                // Try to extract reasoning using universal handler
+                // Check both the item structure and any content/reasoning fields
+                let reasoningResult = universalReasoningHandler.extractReasoning(item as any, this.model);
+                
+                // Also check if this is a message item with content that has reasoning
+                if (!reasoningResult && (item as any).type === "message" && (item as any).content) {
+                  const content = (item as any).content;
+                  if (Array.isArray(content)) {
+                    for (const contentItem of content) {
+                      if (contentItem.reasoning) {
+                        console.log(`🧠 [Agent] Found reasoning in content item`);
+                        reasoningResult = universalReasoningHandler.extractReasoning({
+                          reasoning: contentItem.reasoning,
+                          type: "message"
+                        }, this.model);
+                        break;
+                      }
+                    }
+                  }
+                }
+                
+                if (reasoningResult) {
+                  // Annotate timing if it's a reasoning item
+                  const maybeReasoning = item as any;
                   maybeReasoning.duration_ms = Date.now() - thinkingStart;
+                  
+                  console.log(`🧠 [SmartContext] REASONING DETECTED!`);
+                  console.log(`🧠 [SmartContext] Provider: ${reasoningResult.provider}, Format: ${reasoningResult.format}`);
+                  console.log(`🧠 [SmartContext] Confidence: ${reasoningResult.confidence}, Length: ${reasoningResult.content.length} chars`);
+                  
+                  log(`[SmartContext] Universal reasoning extracted:`, {
+                    provider: reasoningResult.provider,
+                    model: reasoningResult.model,
+                    format: reasoningResult.format,
+                    confidence: reasoningResult.confidence,
+                    contentLength: reasoningResult.content.length
+                  });
+                  
+                  if (reasoningResult.content && reasoningResult.content.length > 0) {
+                    const userPrompt = this.extractUserPrompt(turnInput);
+                    processReasoningStreamInBackground(
+                      reasoningResult.content,
+                      {
+                        userPrompt: userPrompt || undefined,
+                        success: true, // Will be updated later if errors occur
+                        errorOccurred: false
+                      },
+                      process.cwd()
+                    ).catch(error => {
+                      // Silent fail for background processing
+                      log(`[SmartContext] Background reasoning processing error: ${error}`);
+                    });
+                  } else {
+                    log(`[SmartContext] Reasoning content invalid or missing`);
+                  }
                 }
                 if (
                   item.type === "function_call" ||
@@ -1067,6 +1214,87 @@ export class AgentLoop {
               }
 
               if (event.type === "response.completed") {
+                // Universal Reasoning Handler - Check completed response for reasoning
+                const { universalReasoningHandler } = await import('../reasoning/reasoning-handler.js');
+                const { processReasoningStreamInBackground } = await import('../smart-context/smart-context-service.js');
+                
+                let reasoningProcessed = false;
+                
+                // Check if the response contains reasoning in conversation messages (turnInput)
+                if (turnInput.length > 0) {
+                  const lastMessage = turnInput[turnInput.length - 1];
+                  if (typeof lastMessage === 'object' && (lastMessage as any).reasoning) {
+                    console.log(`🧠 [Agent] Found reasoning in turnInput message`);
+                    const reasoningResult = universalReasoningHandler.extractReasoning(lastMessage as any, this.model);
+                    
+                    if (reasoningResult) {
+                      console.log(`🧠 [SmartContext] REASONING DETECTED FROM TURN INPUT!`);
+                      console.log(`🧠 [SmartContext] Provider: ${reasoningResult.provider}, Format: ${reasoningResult.format}`);
+                      console.log(`🧠 [SmartContext] Confidence: ${reasoningResult.confidence}, Length: ${reasoningResult.content.length} chars`);
+                      
+                      // Display the actual reasoning content
+                      console.log(`\n📋 [REASONING CONTENT] ====================================`);
+                      console.log(reasoningResult.content);
+                      console.log(`==================================================== [END]\n`);
+                      
+                      // Process reasoning for Smart Context
+                      const userPrompt = this.extractUserPrompt(turnInput);
+                      processReasoningStreamInBackground(
+                        reasoningResult.content,
+                        {
+                          userPrompt: userPrompt || undefined,
+                          success: true,
+                          errorOccurred: false
+                        },
+                        process.cwd()
+                      ).catch(error => {
+                        console.error(`🧠 [SmartContext] Error processing reasoning: ${error}`);
+                      });
+                      
+                      reasoningProcessed = true;
+                    }
+                  }
+                }
+                
+                // Also check the completed response output for reasoning content (from streaming accumulation)
+                if (!reasoningProcessed && event.response.output && event.response.output.length > 0) {
+                  for (const outputItem of event.response.output) {
+                    if (outputItem.type === "message" && outputItem.role === "assistant") {
+                      // Check if this message has reasoning content (from streaming)
+                      universalReasoningHandler.debugItem(outputItem);
+                      const reasoningResult = universalReasoningHandler.extractReasoning(outputItem, this.model);
+                      
+                      if (reasoningResult) {
+                        console.log(`🧠 [SmartContext] REASONING DETECTED FROM RESPONSE OUTPUT!`);
+                        console.log(`🧠 [SmartContext] Provider: ${reasoningResult.provider}, Format: ${reasoningResult.format}`);
+                        console.log(`🧠 [SmartContext] Confidence: ${reasoningResult.confidence}, Length: ${reasoningResult.content.length} chars`);
+                        
+                        // Display the actual reasoning content
+                        console.log(`\n📋 [REASONING CONTENT] ====================================`);
+                        console.log(reasoningResult.content);
+                        console.log(`==================================================== [END]\n`);
+                        
+                        // Process reasoning for Smart Context
+                        const userPrompt = this.extractUserPrompt(turnInput);
+                        processReasoningStreamInBackground(
+                          reasoningResult.content,
+                          {
+                            userPrompt: userPrompt || undefined,
+                            success: true,
+                            errorOccurred: false
+                          },
+                          process.cwd()
+                        ).catch(error => {
+                          console.error(`🧠 [SmartContext] Error processing reasoning: ${error}`);
+                        });
+                        
+                        reasoningProcessed = true;
+                        break; // Only process the first assistant message with reasoning
+                      }
+                    }
+                  }
+                }
+                
                 if (thisGeneration === this.generation && !this.canceled) {
                   for (const item of event.response.output) {
                     stageItem(item as ResponseItem);
@@ -1171,14 +1399,16 @@ export class AgentLoop {
 
               // Re‑create the stream with the *same* parameters.
               let reasoning: Reasoning | undefined;
-              if (this.model.startsWith("o")) {
+              // Only enable reasoning for OpenAI provider to avoid API errors
+              if ((!this.config.provider || this.config.provider?.toLowerCase() === "openai") && 
+                  this.model.startsWith("o")) {
                 reasoning = { effort: "high" };
                 if (
                   this.model === "o3" ||
                   this.model === "o4-mini" ||
                   this.model === "codex-mini-latest"
                 ) {
-                  reasoning.summary = "auto";
+                  reasoning.summary = "detailed"; // Try "detailed" instead of "auto" for better access
                 }
               }
 
