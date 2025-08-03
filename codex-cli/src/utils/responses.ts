@@ -532,8 +532,11 @@ async function* streamResponses(
       const reasoningChunk = (choice.delta as any).reasoning;
       if (typeof reasoningChunk === 'string') {
         accumulatedReasoning += reasoningChunk;
-        console.log(`🧠 [Streaming] Reasoning chunk: ${reasoningChunk.length} chars`);
+        // Suppress console output during UI rendering to prevent interference
+        // console.log(`🧠 [Streaming] Reasoning chunk: ${reasoningChunk.length} chars`);
       }
+      // Skip processing this chunk as regular content to avoid UI duplication
+      continue;
     }
     if (
       !isToolCall &&
@@ -674,7 +677,7 @@ async function* streamResponses(
         // Add accumulated reasoning to the output item for Universal Reasoning Handler
         if (accumulatedReasoning.length > 0) {
           item.reasoning = accumulatedReasoning;
-          console.log(`🧠 [Streaming] Added reasoning to output item: ${accumulatedReasoning.length} chars`);
+          // console.log(`🧠 [Streaming] Added reasoning to output item: ${accumulatedReasoning.length} chars`);
         }
         
         yield {
@@ -727,7 +730,7 @@ async function* streamResponses(
     
     // Add accumulated reasoning to the assistant message for Universal Reasoning Handler
     if (accumulatedReasoning.length > 0) {
-      console.log(`🧠 [Streaming] Final reasoning: ${accumulatedReasoning.length} chars total`);
+      // console.log(`🧠 [Streaming] Final reasoning: ${accumulatedReasoning.length} chars total`);
       (assistantMessage as any).reasoning = accumulatedReasoning;
     }
 

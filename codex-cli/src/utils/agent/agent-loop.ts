@@ -32,7 +32,7 @@ import {
 } from "../session.js";
 import { applyPatchToolInstructions } from "./apply-patch.js";
 import { handleExecCommand } from "./handle-exec-command.js";
-import { enhanceInstructionsWithContext, processReasoningStreamInBackground } from "../smart-context/smart-context-service.js";
+import { enhanceInstructionsWithMicroChunks, storeInsightsFromPrompt, storeInsightsFromReasoning } from "../smart-context/smart-context-service-v2.js";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -854,28 +854,31 @@ export class AgentLoop {
             // Extract user prompt for smart context analysis
             const userPrompt = this.extractUserPrompt(turnInput);
             
-            // Enhance instructions with smart context and store context from prompt
+            // Enhance instructions with smart context micro-chunks and store insights
             let enhancedInstructions = this.instructions || "";
             if (userPrompt) {
-              console.log(`📝 [SmartContext] USER PROMPT DETECTED: "${userPrompt.substring(0, 50)}..."`);
+              console.log(`📝 [SmartContextV2] USER PROMPT DETECTED: "${userPrompt.substring(0, 50)}..."`);
               try {
-                const contextResult = await enhanceInstructionsWithContext(
+                // Enhance instructions with relevant micro-chunks
+                const contextResult = await enhanceInstructionsWithMicroChunks(
                   this.instructions || "",
                   userPrompt,
-                  process.cwd(),
-                  { storeContext: true } // Enable context storage
+                  process.cwd()
                 );
+                
                 if (contextResult.success) {
                   enhancedInstructions = contextResult.enhancedInstructions;
-                  log(`[SmartContext] Enhanced instructions: ${contextResult.contextSummary}`);
-                  
-                  // Log storage results if available
-                  if (contextResult.storageResult?.stored) {
-                    log(`[SmartContext] Stored context: ${contextResult.storageResult.filesCreated} files`);
-                  }
+                  log(`[SmartContextV2] Enhanced instructions: ${contextResult.contextSummary} (${contextResult.processingTime}ms)`);
                 }
+
+                // Store insights from user prompt (background operation)
+                storeInsightsFromPrompt(userPrompt, process.cwd(), {
+                  projectType: 'codex-cli',
+                  previousContext: contextResult.contextSummary
+                });
+                
               } catch (error) {
-                log(`[SmartContext] Context enhancement failed: ${error}`);
+                log(`[SmartContextV2] Context enhancement failed: ${error}`);
                 // Continue with original instructions
               }
             }
@@ -1178,18 +1181,17 @@ export class AgentLoop {
                   
                   if (reasoningResult.content && reasoningResult.content.length > 0) {
                     const userPrompt = this.extractUserPrompt(turnInput);
-                    processReasoningStreamInBackground(
+                    // Store insights from AI reasoning (background operation)
+                    storeInsightsFromReasoning(
                       reasoningResult.content,
+                      process.cwd(),
                       {
                         userPrompt: userPrompt || undefined,
                         success: true, // Will be updated later if errors occur
-                        errorOccurred: false
-                      },
-                      process.cwd()
-                    ).catch(error => {
-                      // Silent fail for background processing
-                      log(`[SmartContext] Background reasoning processing error: ${error}`);
-                    });
+                        errorOccurred: false,
+                        modelUsed: this.model
+                      }
+                    );
                   } else {
                     log(`[SmartContext] Reasoning content invalid or missing`);
                   }
@@ -1237,19 +1239,18 @@ export class AgentLoop {
                       console.log(reasoningResult.content);
                       console.log(`==================================================== [END]\n`);
                       
-                      // Process reasoning for Smart Context
+                      // Store insights from AI reasoning (background operation)  
                       const userPrompt = this.extractUserPrompt(turnInput);
-                      processReasoningStreamInBackground(
+                      storeInsightsFromReasoning(
                         reasoningResult.content,
+                        process.cwd(),
                         {
                           userPrompt: userPrompt || undefined,
                           success: true,
-                          errorOccurred: false
-                        },
-                        process.cwd()
-                      ).catch(error => {
-                        console.error(`🧠 [SmartContext] Error processing reasoning: ${error}`);
-                      });
+                          errorOccurred: false,
+                          modelUsed: this.model
+                        }
+                      );
                       
                       reasoningProcessed = true;
                     }

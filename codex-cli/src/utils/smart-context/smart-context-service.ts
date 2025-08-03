@@ -1,13 +1,11 @@
 /**
- * Smart Context Service - Main integration point for Codex
- * Provides simplified interface for context analysis and retrieval
+ * Enhanced Smart Context Service - High-performance micro-chunk system
+ * Real-time learning from user prompts and AI reasoning
  */
 
-import OpenAI from 'openai';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
-import { join, dirname } from 'path';
 import { log } from '../logger/log.js';
-import { getApiKey, getBaseUrl } from '../config.js';
+import { getMicroChunkManager, type MicroChunk } from './micro-chunk-manager.js';
+import { getInsightExtractor } from './insight-extractor.js';
 
 /**
  * Context analysis result
