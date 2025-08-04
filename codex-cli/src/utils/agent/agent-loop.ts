@@ -868,10 +868,15 @@ export class AgentLoop {
                 
                 if (contextResult.success) {
                   enhancedInstructions = contextResult.enhancedInstructions;
+                  console.log(`🎯 [SmartContextV2] CONTEXT INJECTED: ${contextResult.contextSummary} (${contextResult.processingTime}ms)`);
+                  console.log(`📦 [SmartContextV2] Using ${contextResult.chunksUsed} chunks, keywords: [${contextResult.keywords.join(', ')}]`);
                   log(`[SmartContextV2] Enhanced instructions: ${contextResult.contextSummary} (${contextResult.processingTime}ms)`);
+                } else {
+                  console.log(`❌ [SmartContextV2] CONTEXT ENHANCEMENT FAILED: ${contextResult.error || 'Unknown error'}`);
                 }
 
                 // Store insights from user prompt (background operation)
+                console.log(`💾 [SmartContextV2] STORING insights from user prompt (background)...`);
                 storeInsightsFromPrompt(userPrompt, process.cwd(), {
                   projectType: 'codex-cli',
                   previousContext: contextResult.contextSummary
@@ -1182,6 +1187,7 @@ export class AgentLoop {
                   if (reasoningResult.content && reasoningResult.content.length > 0) {
                     const userPrompt = this.extractUserPrompt(turnInput);
                     // Store insights from AI reasoning (background operation)
+                    console.log(`🧠💾 [SmartContextV2] STORING insights from AI reasoning (${reasoningResult.content.length} chars, ${reasoningResult.provider})...`);
                     storeInsightsFromReasoning(
                       reasoningResult.content,
                       process.cwd(),
@@ -1240,6 +1246,7 @@ export class AgentLoop {
                       console.log(`==================================================== [END]\n`);
                       
                       // Store insights from AI reasoning (background operation)  
+                      console.log(`🧠💾 [SmartContextV2] STORING insights from reasoning stream (${reasoningResult.content.length} chars, ${reasoningResult.provider})...`);
                       const userPrompt = this.extractUserPrompt(turnInput);
                       storeInsightsFromReasoning(
                         reasoningResult.content,

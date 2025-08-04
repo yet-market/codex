@@ -131,6 +131,7 @@ export class MicroChunkManager {
       .map(item => item.chunk);
 
     const retrievalTime = Date.now() - startTime;
+    console.log(`📦 [MicroChunk] RETRIEVED ${topChunks.length} chunks in ${retrievalTime}ms`);
     log(`[MicroChunk] Retrieved ${topChunks.length} chunks in ${retrievalTime}ms`);
     
     return topChunks;
@@ -175,6 +176,7 @@ export class MicroChunkManager {
     // Update index
     this.updateIndex(chunk);
     
+    console.log(`💾 [MicroChunk] STORED: ${id} (${insight.content.length} chars) in ${insight.category}/${insight.subcategory}`);
     log(`[MicroChunk] Stored: ${id} (${insight.content.length} chars)`);
   }
 

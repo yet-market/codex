@@ -206,6 +206,7 @@ export class EnhancedSmartContextService {
         processingTime: Date.now() - startTime
       };
 
+      console.log(`✅ [SmartContextV2] STORED ${insights.length} insights from user prompt successfully!`);
       log(`[SmartContextV2] Stored ${insights.length} insights from user prompt`);
       return result;
 
@@ -271,6 +272,7 @@ export class EnhancedSmartContextService {
         processingTime: Date.now() - startTime
       };
 
+      console.log(`✅ [SmartContextV2] STORED ${insights.length} insights from AI reasoning successfully!`);
       log(`[SmartContextV2] Stored ${insights.length} insights from AI reasoning`);
       return result;
 
